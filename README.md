@@ -1,6 +1,4 @@
-# 供应商数据抓取工具 - Go版本
-
-这是Python版本 `fetch_api_data.py` 的Go语言翻译版本。
+# 供应商数据抓取工具
 
 ## 功能特性
 
@@ -49,19 +47,8 @@ fetch_data.exe
 ```bash
 go run main.go my_config.json
 ```
+## 输出文件说明
 
-## 与Python版本的对比
-
-| 特性 | Python版本 | Go版本 |
-|------|-----------|--------|
-| 配置文件支持 | ✅ | ✅ |
-| 多线程抓取 | ✅ (ThreadPoolExecutor) | ✅ (Goroutines) |
-| CSV导出 | ✅ | ✅ |
-| 性能 | 快 | 更快 |
-| 部署 | 需要Python环境 | 单个可执行文件 |
-| 依赖管理 | pip/requirements.txt | go.mod（标准库） |
-
-## 输出文件
 
 程序会自动生成以下格式的CSV文件：
 ```
@@ -91,7 +78,7 @@ Go版本使用以下技术优化性能：
 ## 故障排查
 
 ### 问题1: "配置文件不存在"
-确保 `config.json` 文件与程序在同一目录下。
+程序使用以下技术优化性能：
 
 ### 问题2: "access_token 未配置"
 在 `config.json` 中填入有效的访问令牌。
