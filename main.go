@@ -412,7 +412,12 @@ func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename 
 			for _, row := range rows {
 				strRow := make([]string, len(row))
 				for i, cell := range row {
-					strRow[i] = fmt.Sprintf("%v", cell)
+					// 处理 nil 值为空字符串，其他值添加制表符前缀强制Excel识别为文本格式
+					if cell == nil {
+						strRow[i] = "\t"
+					} else {
+						strRow[i] = fmt.Sprintf("\t%v", cell)
+					}
 				}
 				writer.Write(strRow)
 				totalRows++
