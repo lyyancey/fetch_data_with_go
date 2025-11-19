@@ -1,6 +1,8 @@
 {
-  "access_token": "AT-430264-V3DfqQ0RDlkL7YUjB9LjuqlQGgi5tBdwVV5",
+  "access_token": "AT-538789-9cnnPdk6b4NzVqac1IeWKcsFYuIzgMtHsdY",
   "page_size": 1000,
   "request_delay": 0.5,
-  "output_file_prefix": "supplier_data"
+  "output_file_prefix": "supplier_data",
+  "max_workers": 5,
+  "base_url": "https://one.cnncecp.com/cnnc-ps-api/"
 }

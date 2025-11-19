@@ -2,14 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +22,8 @@ type Config struct {
 	PageSize         int     `json:"page_size"`
 	RequestDelay     float64 `json:"request_delay"`
 	OutputFilePrefix string  `json:"output_file_prefix"`
+	MaxWorkers       int     `json:"max_workers"`
+	BaseURL          string  `json:"base_url"`
 }
 
 // DataFetcher 数据抓取器
@@ -31,6 +36,7 @@ type DataFetcher struct {
 	baseURL          string
 	csvHeaders       []string
 	client           *http.Client
+	maxWorkers       int
 }
 
 // PayloadBlock 请求体中的块结构
@@ -84,7 +90,8 @@ func NewDataFetcher(configFile string) (*DataFetcher, error) {
 		pageSize:         config.PageSize,
 		requestDelay:     time.Duration(config.RequestDelay * float64(time.Second)),
 		outputFilePrefix: config.OutputFilePrefix,
-		baseURL:          "https://one.cnncecp.com/cnnc-ps-api/",
+		baseURL:          config.BaseURL,
+		maxWorkers:       config.MaxWorkers,
 		csvHeaders: []string{
 			"supplierName", "unifiedSocialCode", "updateDate",
 			"domesticForeignRelation", "companyType", "licenceEndDate",
@@ -106,6 +113,12 @@ func NewDataFetcher(configFile string) (*DataFetcher, error) {
 	}
 	if df.outputFilePrefix == "" {
 		df.outputFilePrefix = "supplier_data"
+	}
+	if df.maxWorkers == 0 {
+		df.maxWorkers = 5
+	}
+	if df.baseURL == "" {
+		df.baseURL = "https://one.cnncecp.com/cnnc-ps-api/"
 	}
 
 	return df, nil
@@ -223,7 +236,7 @@ func (df *DataFetcher) buildPayload() Payload {
 }
 
 // fetchData 发送POST请求获取数据
-func (df *DataFetcher) fetchData(payload Payload) (*Response, error) {
+func (df *DataFetcher) fetchData(ctx context.Context, payload Payload) (*Response, error) {
 	// 序列化payload
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -231,7 +244,7 @@ func (df *DataFetcher) fetchData(payload Payload) (*Response, error) {
 	}
 
 	// 创建请求
-	req, err := http.NewRequest("POST", df.baseURL, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", df.baseURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %v", err)
 	}
@@ -255,11 +268,20 @@ func (df *DataFetcher) fetchData(payload Payload) (*Response, error) {
 		return nil, fmt.Errorf("读取响应失败: %v", err)
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("服务器返回错误状态码: %d, 响应内容: %s", resp.StatusCode, string(body))
+	}
+
 	// 解析JSON
 	var response Response
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %v", err)
+		// 尝试打印前100个字符以供调试
+		preview := string(body)
+		if len(preview) > 100 {
+			preview = preview[:100] + "..."
+		}
+		return nil, fmt.Errorf("JSON解析失败: %v, 响应内容: %s", err, preview)
 	}
 
 	return &response, nil
@@ -273,7 +295,7 @@ type PageResult struct {
 }
 
 // FetchAllDataMultithread 多线程分页抓取数据
-func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename string, maxWorkers int) (int, error) {
+func (df *DataFetcher) FetchAllDataMultithread(ctx context.Context, basePayload Payload, csvFilename string) (int, error) {
 	if csvFilename == "" {
 		timestamp := time.Now().Format("20060102_150405")
 		csvFilename = fmt.Sprintf("%s_%s.csv", df.outputFilePrefix, timestamp)
@@ -281,7 +303,7 @@ func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename 
 
 	fmt.Printf("\n开始多线程抓取数据...\n")
 	fmt.Printf("每页大小: %d 条\n", df.pageSize)
-	fmt.Printf("最大线程数: %d\n", maxWorkers)
+	fmt.Printf("最大线程数: %d\n", df.maxWorkers)
 	fmt.Printf("输出文件: %s\n", csvFilename)
 	fmt.Println("======================================================================")
 
@@ -295,7 +317,7 @@ func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename 
 	block.Attr = resultAttr
 	payload.Blocks["result"] = block
 
-	response, err := df.fetchData(payload)
+	response, err := df.fetchData(ctx, payload)
 	if err != nil {
 		return 0, fmt.Errorf("首次请求失败: %v", err)
 	}
@@ -316,32 +338,91 @@ func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename 
 	fmt.Printf("✓ 预计总页数: %d 页\n", totalPages)
 	fmt.Println("======================================================================")
 
+	// 创建CSV文件
+	file, err := os.Create(csvFilename)
+	if err != nil {
+		return 0, fmt.Errorf("创建CSV文件失败: %v", err)
+	}
+	defer file.Close()
+
+	// 写入UTF-8 BOM
+	file.Write([]byte{0xEF, 0xBB, 0xBF})
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 写入表头
+	writer.Write(df.csvHeaders)
+
 	// 创建任务通道和结果通道
 	tasks := make(chan struct {
 		pageNum int
 		offset  int
 	}, totalPages)
-	results := make(chan PageResult, totalPages)
+	results := make(chan PageResult, df.maxWorkers) // 缓冲结果，避免阻塞worker
+
+	// 启动结果处理协程（写入CSV）
+	var writeWg sync.WaitGroup
+	writeWg.Add(1)
+	totalRows := 0
+	go func() {
+		defer writeWg.Done()
+		for result := range results {
+			if result.Err != nil {
+				fmt.Printf("❌ 第%d页抓取失败: %v\n", result.PageNum, result.Err)
+				continue
+			}
+			if result.Rows != nil {
+				for _, row := range result.Rows {
+					strRow := make([]string, len(row))
+					for i, cell := range row {
+						if cell == nil {
+							strRow[i] = "\t"
+						} else {
+							strRow[i] = fmt.Sprintf("\t%v", cell)
+						}
+					}
+					writer.Write(strRow)
+					totalRows++
+				}
+				writer.Flush() // 及时刷新
+			}
+		}
+	}()
 
 	// 填充任务
-	for page := 0; page < totalPages; page++ {
-		tasks <- struct {
-			pageNum int
-			offset  int
-		}{
-			pageNum: page + 1,
-			offset:  page * df.pageSize,
+	go func() {
+		for page := 0; page < totalPages; page++ {
+			select {
+			case <-ctx.Done():
+				close(tasks)
+				return
+			case tasks <- struct {
+				pageNum int
+				offset  int
+			}{
+				pageNum: page + 1,
+				offset:  page * df.pageSize,
+			}:
+			}
 		}
-	}
-	close(tasks)
+		close(tasks)
+	}()
 
 	// 启动工作协程
 	var wg sync.WaitGroup
-	for i := 0; i < maxWorkers; i++ {
+	for i := 0; i < df.maxWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for task := range tasks {
+				// 检查上下文是否取消
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				// 复制payload
 				payload := basePayload
 				resultAttr := payload.Blocks["result"].Attr.(map[string]interface{})
@@ -353,16 +434,14 @@ func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename 
 				payload.Blocks["result"] = block
 
 				// 抓取数据
-				response, err := df.fetchData(payload)
+				response, err := df.fetchData(ctx, payload)
 				if err != nil {
-					fmt.Printf("❌ 第%d页(offset=%d) 抓取失败: %v\n", task.pageNum, task.offset, err)
 					results <- PageResult{PageNum: task.pageNum, Rows: nil, Err: err}
 					continue
 				}
 
 				resultBlock, ok := response.Blocks["result"]
 				if !ok {
-					fmt.Printf("⚠️ 第%d页(offset=%d) 数据格式异常\n", task.pageNum, task.offset)
 					results <- PageResult{PageNum: task.pageNum, Rows: [][]interface{}{}, Err: nil}
 					continue
 				}
@@ -377,60 +456,35 @@ func (df *DataFetcher) FetchAllDataMultithread(basePayload Payload, csvFilename 
 		}()
 	}
 
-	// 等待所有任务完成
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	// 等待所有工作协程完成
+	wg.Wait()
+	close(results)
 
-	// 收集结果
-	allRows := make([][][]interface{}, totalPages)
-	for result := range results {
-		allRows[result.PageNum-1] = result.Rows
-	}
-
-	// 写入CSV
-	totalRows := 0
-	file, err := os.Create(csvFilename)
-	if err != nil {
-		return 0, fmt.Errorf("创建CSV文件失败: %v", err)
-	}
-	defer file.Close()
-
-	// 写入UTF-8 BOM以支持Excel正确显示中文
-	file.Write([]byte{0xEF, 0xBB, 0xBF})
-
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// 写入表头
-	writer.Write(df.csvHeaders)
-
-	// 写入数据行
-	for _, rows := range allRows {
-		if rows != nil {
-			for _, row := range rows {
-				strRow := make([]string, len(row))
-				for i, cell := range row {
-					// 处理 nil 值为空字符串，其他值添加制表符前缀强制Excel识别为文本格式
-					if cell == nil {
-						strRow[i] = "\t"
-					} else {
-						strRow[i] = fmt.Sprintf("\t%v", cell)
-					}
-				}
-				writer.Write(strRow)
-				totalRows++
-			}
-		}
-	}
+	// 等待写入完成
+	writeWg.Wait()
 
 	fmt.Println("======================================================================")
-	fmt.Printf("\n✅ 多线程抓取完成！共保存 %d 条数据\n", totalRows)
+	if ctx.Err() != nil {
+		fmt.Printf("\n⚠️ 任务被中断！共保存 %d 条数据\n", totalRows)
+	} else {
+		fmt.Printf("\n✅ 多线程抓取完成！共保存 %d 条数据\n", totalRows)
+	}
 	return totalRows, nil
 }
 
 func main() {
+	// 设置信号处理
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n\n⚠️ 接收到中断信号，正在停止...")
+		cancel()
+	}()
+
 	configFile := "config.json"
 	if len(os.Args) > 1 {
 		configFile = os.Args[1]
@@ -469,7 +523,7 @@ func main() {
 	}
 
 	// 多线程抓取并保存数据
-	totalRows, err := fetcher.FetchAllDataMultithread(basePayload, "", 5)
+	totalRows, err := fetcher.FetchAllDataMultithread(ctx, basePayload, "")
 	if err != nil {
 		fmt.Printf("\n❌ 抓取失败: %v\n", err)
 		return
